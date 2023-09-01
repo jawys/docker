@@ -1,6 +1,30 @@
 ARG PHP_VERSION
 ARG PROJECT_TYPE
 
+FROM alpine:3.18 AS mozjpeg
+WORKDIR /tmp
+ENV MOZJPEG_BUILD_DEPS \
+    autoconf \
+    automake \
+    build-base \
+    libtool \
+    nasm \
+    pkgconf \
+    tar
+ENV MOZJPEG_VERSION="3.3.1"
+ADD https://github.com/mozilla/mozjpeg/archive/v${MOZJPEG_VERSION}.tar.gz ./
+RUN <<EOF
+    set -eux
+    apk add --no-cache --virtual .mozjpeg_build_deps $MOZJPEG_BUILD_DEPS
+    tar -xzf v${MOZJPEG_VERSION}.tar.gz --strip-components=1
+    autoreconf -fiv
+    ./configure --with-jpeg8
+    make -j$(nproc)
+    make -j$(nproc) install
+    apk del --no-network .mozjpeg_build_deps
+    find /tmp -mindepth 1 -delete
+EOF
+
 FROM alpine:3.13 AS iconv-build
 RUN apk upgrade --no-cache \
     && apk add --no-cache gnu-libiconv
@@ -37,90 +61,68 @@ ENV PHP_OPCACHE_MAX_WASTED_PERCENTAGE=$PHP_OPCACHE_MAX_WASTED_PERCENTAGE_ARG
 ENV PHP_OPCACHE_INTERNED_STRINGS_BUFFER=$PHP_OPCACHE_INTERNED_STRINGS_BUFFER_ARG
 ENV PHP_OPCACHE_FAST_SHUTDOWN=$PHP_OPCACHE_FAST_SHUTDOWN_ARG
 
-# MozJPEG
-ENV MOZJPEG_VERSION="3.3.1"
-ENV MOZJPEG_BUILD_DEPS \
-    autoconf \
-    automake \
-    build-base \
-    libtool \
-    nasm \
-    pkgconf \
-    tar
+RUN <<EOF
+    set -eux -o pipefail
+    apk add --no-cache --virtual .build-deps \
+        freetype-dev \
+        icu-data-full \
+        icu-dev \
+        imagemagick-dev \
+        libjpeg-turbo-dev \
+        libpng-dev \
+        libwebp-dev \
+        libxml2-dev \
+        libzip-dev \
+        postgresql-dev \
+    ;
+    docker-php-ext-configure gd \
+        --with-freetype \
+        --with-jpeg \
+        --with-webp \
+    ;
+    docker-php-ext-install -j$(nproc) \
+        bcmath \
+        gd \
+        intl \
+        opcache \
+        pdo \
+        pdo_mysql \
+        pdo_pgsql \
+        soap \
+        zip \
+    ;
+    apk add --no-cache --virtual .phpize-deps-configure $PHPIZE_DEPS
+    pecl install \
+        imagick \
+        redis \
+    ;
+    docker-php-ext-enable \
+        imagick \
+        redis \
+    ;
+    apk del --no-network .phpize-deps-configure
+    runDeps="$( \
+        scanelf --needed --nobanner --format '%n#p' --recursive /usr/local \
+            | tr ',' '\n' \
+            | sort -u \
+            | awk 'system("[ -e /usr/local/lib/" $1 " ]") == 0 { next } { print "so:" $1 }' \
+    )";
+    apk add --no-cache $runDeps
+    apk del --no-network .build-deps
+    find /tmp -mindepth 1 -delete
+EOF
 
-RUN set -ex \
-    && apk upgrade --no-cache \
-    && apk add --no-cache --virtual .build-deps \
-    $PHPIZE_DEPS \
-    $MOZJPEG_BUILD_DEPS \
-    freetype-dev \
-    icu-dev \
-    icu-data-full \
-    libwebp-dev \
-    imagemagick-dev \
-    libjpeg-turbo-dev \
-    libpng-dev \
-    libxml2-dev \
-    libzip-dev \
-    postgresql-dev \
-    && apk add --no-cache \
-    gifsicle \
-    imagemagick \
-    jpegoptim \
-    libjpeg-turbo-utils \
-    libwebp-tools \
-    optipng \
-    pngquant \
-    && docker-php-ext-configure gd \
-    --with-freetype \
-    --with-jpeg \
-    --with-webp \
-    && docker-php-ext-install -j$(nproc) \
-    bcmath \
-    gd \
-    intl \
-    opcache \
-    pdo \
-    pdo_mysql \
-    pdo_pgsql \
-    soap \
-    zip \
-    && pecl install \
-    imagick \
-    redis \
-    && docker-php-ext-enable \
-    imagick \
-    redis
+# copy + link mozjpeg in single layer
+RUN --mount=from=mozjpeg,target=/mnt <<EOF
+    cp -a /mnt/opt/mozjpeg /opt
+    ln -s /opt/mozjpeg/bin/jpegtran /usr/local/bin/mozjpegtran
+    ln -s /opt/mozjpeg/bin/cjpeg /usr/local/bin/mozcjpeg
+EOF
 
 # https://github.com/craftcms/docker/issues/16
 COPY --from=iconv-build /usr/lib/preloadable_libiconv.so /usr/lib/preloadable_libiconv.so
-
 # https://github.com/docker-library/php/issues/1121
 ENV LD_PRELOAD /usr/lib/preloadable_libiconv.so
-
-# MozJPEG
-WORKDIR /tmp
-ADD https://github.com/mozilla/mozjpeg/archive/v${MOZJPEG_VERSION}.tar.gz ./
-RUN set -ex \
-    && tar -xzf v${MOZJPEG_VERSION}.tar.gz \
-    && cd ./mozjpeg-${MOZJPEG_VERSION} \
-    && autoreconf -fiv \
-    && ./configure --with-jpeg8 \
-    && make \
-    && make install
-
-RUN ln -s /opt/mozjpeg/bin/jpegtran /usr/local/bin/mozjpegtran
-RUN ln -s /opt/mozjpeg/bin/cjpeg /usr/local/bin/mozcjpeg
-
-# Cleanup
-RUN RUNTIME_DEPS="$(scanelf --needed --nobanner --recursive /usr/local \
-    | awk '{ gsub(/,/, "\nso:", $2); print "so:" $2 }' \
-    | sort -u \
-    | xargs -r apk info --installed \
-    | sort -u)" \
-    && apk add --no-cache --virtual .runtime-deps $RUNTIME_DEPS \
-    && apk del --no-network .build-deps \
-    && rm -rf /tmp/*
 
 # copy custom.ini settings
 COPY craft-cms.ini /usr/local/etc/php/conf.d/
